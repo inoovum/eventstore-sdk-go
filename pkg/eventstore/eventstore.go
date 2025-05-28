@@ -1,10 +1,16 @@
 package eventstore
 
 import (
-	"context"
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
 
-	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/google/uuid"
 )
 
 // Config holds the configuration for the EventStore client
@@ -16,15 +22,20 @@ type Config struct {
 
 // EventStore represents the client for interacting with the EventStore API
 type EventStore struct {
-	config     *Config
-	ceClient   cloudevents.Client
+	config   *Config
+	client   *http.Client
 }
 
 // Event represents an event in the EventStore
 type Event struct {
-	Subject string
-	Type    string
-	Data    interface{}
+	ID              string                 `json:"id,omitempty"`
+	Source          string                 `json:"source,omitempty"`
+	Subject         string                 `json:"subject"`
+	Type            string                 `json:"type"`
+	Time            *time.Time             `json:"time,omitempty"`
+	Data            interface{}            `json:"data"`
+	DataContentType string                 `json:"datacontenttype,omitempty"`
+	SpecVersion     string                 `json:"specversion,omitempty"`
 }
 
 // NewEventStore creates a new EventStore client
@@ -39,50 +50,245 @@ func NewEventStore(config *Config) (*EventStore, error) {
 		return nil, fmt.Errorf("AuthToken is required")
 	}
 
-	c, err := cloudevents.NewClientHTTP()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create CloudEvents client: %w", err)
-	}
-
 	return &EventStore{
-		config:   config,
-		ceClient: c,
+		config: config,
+		client: &http.Client{},
 	}, nil
 }
 
 // StreamEvents streams events from the specified subject
 func (es *EventStore) StreamEvents(subject string) ([]Event, error) {
-	// Implementation pending
-	return nil, nil
+	url := fmt.Sprintf("%s/api/%s/stream", strings.TrimRight(es.config.APIURL, "/"), es.config.APIVersion)
+
+	requestBody, err := json.Marshal(map[string]string{"subject": subject})
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", es.config.AuthToken))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/x-ndjson")
+	req.Header.Set("User-Agent", "inoovum-eventstore-sdk-go")
+
+	resp, err := es.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error: %s - %s", resp.Status, string(bodyBytes))
+	}
+
+	var events []Event
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var event Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			return nil, fmt.Errorf("error parsing event JSON: %w", err)
+		}
+
+		// Set default values for CloudEvents compliance if not present
+		if event.ID == "" {
+			event.ID = uuid.New().String()
+		}
+		if event.Source == "" {
+			event.Source = es.config.APIURL
+		}
+		if event.DataContentType == "" {
+			event.DataContentType = "application/json"
+		}
+		if event.SpecVersion == "" {
+			event.SpecVersion = "1.0"
+		}
+		if event.Time == nil {
+			now := time.Now().UTC()
+			event.Time = &now
+		}
+
+		events = append(events, event)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading response: %w", err)
+	}
+
+	return events, nil
 }
 
 // CommitEvents commits a batch of events to the EventStore
 func (es *EventStore) CommitEvents(events []Event) error {
-	ctx := context.Background()
-	for _, event := range events {
-		e := cloudevents.NewEvent()
-		e.SetType(event.Type)
-		e.SetSource(es.config.APIURL)
-		e.SetSubject(event.Subject)
-		if err := e.SetData(cloudevents.ApplicationJSON, event.Data); err != nil {
-			return fmt.Errorf("failed to set event data: %w", err)
-		}
+	url := fmt.Sprintf("%s/api/%s/commit", strings.TrimRight(es.config.APIURL, "/"), es.config.APIVersion)
 
-		if result := es.ceClient.Send(ctx, e); cloudevents.IsUndelivered(result) {
-			return fmt.Errorf("failed to send event: %w", result)
+	// Ensure CloudEvents compliance for each event
+	for i := range events {
+		if events[i].ID == "" {
+			events[i].ID = uuid.New().String()
+		}
+		if events[i].Source == "" {
+			events[i].Source = es.config.APIURL
+		}
+		if events[i].DataContentType == "" {
+			events[i].DataContentType = "application/json"
+		}
+		if events[i].SpecVersion == "" {
+			events[i].SpecVersion = "1.0"
+		}
+		if events[i].Time == nil {
+			now := time.Now().UTC()
+			events[i].Time = &now
 		}
 	}
+
+	requestBody, err := json.Marshal(map[string][]Event{"events": events})
+	if err != nil {
+		return fmt.Errorf("error marshaling request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", es.config.AuthToken))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "inoovum-eventstore-sdk-go")
+
+	resp, err := es.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API error: %s - %s", resp.Status, string(bodyBytes))
+	}
+
 	return nil
+}
+
+// Q executes a query against the EventStore
+func (es *EventStore) Q(query string) ([]interface{}, error) {
+	url := fmt.Sprintf("%s/api/%s/q", strings.TrimRight(es.config.APIURL, "/"), es.config.APIVersion)
+
+	requestBody, err := json.Marshal(map[string]string{"query": query})
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", es.config.AuthToken))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/x-ndjson")
+	req.Header.Set("User-Agent", "inoovum-eventstore-sdk-go")
+
+	resp, err := es.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error: %s - %s", resp.Status, string(bodyBytes))
+	}
+
+	var results []interface{}
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var result interface{}
+		if err := json.Unmarshal([]byte(line), &result); err != nil {
+			return nil, fmt.Errorf("error parsing result JSON: %w", err)
+		}
+		results = append(results, result)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading response: %w", err)
+	}
+
+	return results, nil
 }
 
 // Ping checks the health of the EventStore API
 func (es *EventStore) Ping() (string, error) {
-	// Implementation pending
-	return "OK", nil
+	url := fmt.Sprintf("%s/api/%s/status/ping", strings.TrimRight(es.config.APIURL, "/"), es.config.APIVersion)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", es.config.AuthToken))
+	req.Header.Set("User-Agent", "inoovum-eventstore-sdk-go")
+
+	resp, err := es.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error: %s - %s", resp.Status, string(bodyBytes))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error reading response: %w", err)
+	}
+
+	return string(bodyBytes), nil
 }
 
 // Audit runs an audit check on the EventStore
 func (es *EventStore) Audit() (string, error) {
-	// Implementation pending
-	return "OK", nil
+	url := fmt.Sprintf("%s/api/%s/status/audit", strings.TrimRight(es.config.APIURL, "/"), es.config.APIVersion)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", es.config.AuthToken))
+	req.Header.Set("User-Agent", "inoovum-eventstore-sdk-go")
+
+	resp, err := es.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error: %s - %s", resp.Status, string(bodyBytes))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error reading response: %w", err)
+	}
+
+	return string(bodyBytes), nil
 }
