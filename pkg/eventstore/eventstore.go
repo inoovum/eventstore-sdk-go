@@ -26,13 +26,46 @@ type EventStore struct {
 	client   *http.Client
 }
 
+// RFC3339Time is a custom time type that properly handles RFC3339 time strings
+type RFC3339Time time.Time
+
+// UnmarshalJSON implements the json.Unmarshaler interface
+func (t *RFC3339Time) UnmarshalJSON(data []byte) error {
+	// Remove quotes
+	s := strings.Trim(string(data), "\"")
+	if s == "null" || s == "" {
+		*t = RFC3339Time(time.Time{})
+		return nil
+	}
+	// Parse the time string
+	parsedTime, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return err
+	}
+	*t = RFC3339Time(parsedTime)
+	return nil
+}
+
+// MarshalJSON implements the json.Marshaler interface
+func (t RFC3339Time) MarshalJSON() ([]byte, error) {
+	if time.Time(t).IsZero() {
+		return []byte("null"), nil
+	}
+	return []byte(fmt.Sprintf("\"%s\"", time.Time(t).Format(time.RFC3339))), nil
+}
+
+// Time returns the time.Time representation
+func (t RFC3339Time) Time() time.Time {
+	return time.Time(t)
+}
+
 // Event represents an event in the EventStore
 type Event struct {
 	ID              string                 `json:"id,omitempty"`
 	Source          string                 `json:"source,omitempty"`
 	Subject         string                 `json:"subject"`
 	Type            string                 `json:"type"`
-	Time            *time.Time             `json:"time,omitempty"`
+	Time            RFC3339Time            `json:"time,omitempty"`
 	Data            interface{}            `json:"data"`
 	DataContentType string                 `json:"datacontenttype,omitempty"`
 	SpecVersion     string                 `json:"specversion,omitempty"`
@@ -112,9 +145,9 @@ func (es *EventStore) StreamEvents(subject string) ([]Event, error) {
 		if event.SpecVersion == "" {
 			event.SpecVersion = "1.0"
 		}
-		if event.Time == nil {
+		if event.Time == RFC3339Time(time.Time{}) {
 			now := time.Now().UTC()
-			event.Time = &now
+			event.Time = RFC3339Time(now)
 		}
 
 		events = append(events, event)
@@ -145,9 +178,9 @@ func (es *EventStore) CommitEvents(events []Event) error {
 		if events[i].SpecVersion == "" {
 			events[i].SpecVersion = "1.0"
 		}
-		if events[i].Time == nil {
+		if events[i].Time == RFC3339Time(time.Time{}) {
 			now := time.Now().UTC()
-			events[i].Time = &now
+			events[i].Time = RFC3339Time(now)
 		}
 	}
 
