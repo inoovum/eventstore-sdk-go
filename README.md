@@ -40,13 +40,13 @@ if err != nil {
 ### Streaming Events
 
 ```go
-events, err := client.StreamEvents("your-subject")
+events, err := client.StreamEvents("/customer")
 if err != nil {
     log.Fatal(err)
 }
 
 for _, event := range events {
-    fmt.Printf("Event Type: %s, Data: %v\n", event.Type(), event.Data())
+    fmt.Printf("Event Type: %s, Data: %v\n", event.Type, event.Data)
 }
 ```
 
@@ -56,14 +56,14 @@ for _, event := range events {
 // Example for creating a new user
 events := []eventstore.Event{
     {
-        Subject: "/user",
+        Subject: "/user",  // For new resources
         Type:    "added",
         Data: map[string]interface{}{
             "name": "John Doe",
         },
     },
     {
-        Subject: "/user/42fe976a-a17d-4959-9be0-61ebd9cd499a",
+        Subject: "/user/42fe976a-a17d-4959-9be0-61ebd9cd499a",  // For existing resources
         Type:    "updated",
         Data: map[string]interface{}{
             "name": "John Smith",
@@ -74,6 +74,25 @@ events := []eventstore.Event{
 err := client.CommitEvents(events)
 if err != nil {
     log.Fatal(err)
+}
+```
+
+### Querying Events
+
+```go
+query := `
+FROM e IN events
+WHERE e.type == 'user.created'
+PROJECT INTO { id: e.id, name: e.data.name }
+`
+
+results, err := client.Q(query)
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, result := range results {
+    fmt.Printf("Result: %v\n", result)
 }
 ```
 
@@ -94,6 +113,16 @@ if err != nil {
 }
 fmt.Printf("Audit response: %s\n", response)
 ```
+
+## CloudEvents Compliance
+
+All events in the SDK are CloudEvents compliant. The following fields are automatically set if not provided:
+
+* `id`: A new UUID
+* `source`: The API URL
+* `time`: Current UTC timestamp
+* `datacontenttype`: "application/json"
+* `specversion`: "1.0"
 
 ## Error Handling
 
